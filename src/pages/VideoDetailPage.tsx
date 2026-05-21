@@ -112,20 +112,26 @@ export default function VideoDetailPage() {
       <div className="container page-section">
         <div className="detail-layout">
           <div className="detail-main" ref={detailTopRef}>
+            {/* 顶置影院式悬浮播放器 */}
             <div className="detail-player-card">
-              <div className="detail-title-bar">{detail.title}</div>
               <VideoPlayer
                 src={detail.videoSrc}
                 poster={detail.poster}
                 title={detail.title}
                 onFirstPlay={handleFirstPlay}
               />
+            </div>
+
+            {/* 动作区 */}
+            <div className="detail-actions-row">
               <VideoActions
                 video={detail}
                 onHideVideo={handleHideVideo}
                 hideSaving={hideSaving}
               />
             </div>
+
+            {/* 磨砂元数据展板 */}
             <VideoInfoPanel
               video={detail}
               availableTags={tags}
