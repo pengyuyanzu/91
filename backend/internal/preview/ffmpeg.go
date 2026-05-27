@@ -1220,6 +1220,48 @@ func (w *ThumbWorker) Status() TaskStatus {
 	return taskStatus(&w.activity, &w.rateLimit, w.queue.lengthExcluding(currentID))
 }
 
+// WaitIdle 阻塞直到 worker 队列为空且当前没有正在处理的任务。
+//
+// "队列空"的判定基于 videoQueue —— 它在 Enqueue 时 reserve、processQueued
+// defer 里 release，因此 lengthExcluding("") == 0 同时覆盖：
+//   - channel 中尚未被消费的项
+//   - 当前正在 processQueued 的项（哪怕处于 cooldown 等待中）
+//
+// 调用方应通过 ctx 传入超时 / cancel；ctx 结束时返回 ctx.Err()。
+// 200ms 轮询：开销极低，凌晨流水线对几百毫秒级响应延迟不敏感。
+func (w *Worker) WaitIdle(ctx context.Context) error {
+	if w == nil {
+		return nil
+	}
+	return waitQueueIdle(ctx, &w.queue)
+}
+
+// WaitIdle 见 Worker.WaitIdle 注释。
+func (w *ThumbWorker) WaitIdle(ctx context.Context) error {
+	if w == nil {
+		return nil
+	}
+	return waitQueueIdle(ctx, &w.queue)
+}
+
+func waitQueueIdle(ctx context.Context, q *videoQueue) error {
+	if q.lengthExcluding("") == 0 {
+		return nil
+	}
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			if q.lengthExcluding("") == 0 {
+				return nil
+			}
+		}
+	}
+}
+
 func taskStatus(activity *taskActivity, rateLimit *rateLimitState, queueLength int) TaskStatus {
 	if queueLength < 0 {
 		queueLength = 0

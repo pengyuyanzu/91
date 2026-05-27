@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Download, Plus, Power, PowerOff, RefreshCw, RotateCcw, Trash2 } from "lucide-react";
+import { Download, PlayCircle, Plus, Power, PowerOff, RefreshCw, RotateCcw, Trash2 } from "lucide-react";
 import * as api from "./api";
 import { useToast } from "./ToastContext";
 import { Modal } from "./Modal";
@@ -199,6 +199,20 @@ export function DrivesPage() {
     }
   }
 
+  /**
+   * 立即触发完整凌晨流水线（Phase1 扫所有云盘 → Phase2 spider91 爬虫 →
+   * Phase3 spider91 → 云盘迁移）。后端立即返回 202；进度看 backend 日志。
+   * 已在跑时后端会丢弃此次触发，按钮再点也不会重复进入。
+   */
+  async function handleRunNightly() {
+    try {
+      await api.runNightlyJob();
+      show("已触发完整流水线（扫盘 → 91 爬虫 → 迁移），耗时较长，可在 backend 日志观察进度", "success");
+    } catch (e) {
+      show(e instanceof Error ? e.message : "触发失败", "error");
+    }
+  }
+
   async function handleRegenFailed(d: api.AdminDrive) {
     setRegenFailedId(d.id);
     try {
@@ -253,9 +267,19 @@ export function DrivesPage() {
     <section>
       <header className="admin-page__header">
         <h1 className="admin-page__title">网盘管理</h1>
-        <button className="admin-btn is-primary" onClick={openCreate}>
-          <Plus size={14} /> 新建
-        </button>
+        <div style={{ display: "flex", gap: "8px" }}>
+          <button
+            type="button"
+            className="admin-btn"
+            onClick={handleRunNightly}
+            title="立即跑一次完整流水线：扫所有云盘 → 91 爬虫 → spider91 视频迁移到云盘。耗时较长，期间不要重复触发。"
+          >
+            <PlayCircle size={14} /> 立即跑全流程
+          </button>
+          <button className="admin-btn is-primary" onClick={openCreate}>
+            <Plus size={14} /> 新建
+          </button>
+        </div>
       </header>
 
       {storage && <StorageSummary storage={storage} />}

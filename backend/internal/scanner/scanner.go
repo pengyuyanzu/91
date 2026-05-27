@@ -19,7 +19,14 @@ type Scanner struct {
 	MaxDepth int
 	// 回调：新视频被加入后触发 teaser 生成
 	OnNewVideo func(v *catalog.Video)
+	// ProgressInterval 控制扫描内部 heartbeat 的最小输出间隔。
+	// 0 → 默认 30s；< 0 → 关闭 heartbeat（仅留外层 start / done 两行）。
+	// heartbeat 单行格式：
+	//   [scanner] drive=X progress: scanned=N added=K errors=E dirs=M elapsed=Ts at=<dir>
+	ProgressInterval time.Duration
 }
+
+const defaultScanProgressInterval = 30 * time.Second
 
 func New(cat *catalog.Catalog, drv drives.Drive, exts []string, maxDepth int, onNew func(v *catalog.Video)) *Scanner {
 	m := make(map[string]bool, len(exts))
@@ -57,13 +64,44 @@ func (s *Scanner) Run(ctx context.Context, startDirID string) (Stats, error) {
 		VisitedDirIDs:   make(map[string]struct{}),
 		ExcludedFileIDs: make(map[string]struct{}),
 	}
-	if err := s.walk(ctx, startDirID, "", 0, &stats); err != nil {
+
+	// heartbeat 闭包：进 / 退每个目录、每处理完一个文件后调一下，用一个时间戳节流。
+	// 闭包持有的状态都是单 goroutine 顺序写读，不需要锁。
+	interval := s.ProgressInterval
+	if interval == 0 {
+		interval = defaultScanProgressInterval
+	}
+	started := time.Now()
+	lastBeat := started
+	driveID := ""
+	if s.Drive != nil {
+		driveID = s.Drive.ID()
+	}
+	progress := func(currentDir string) {
+		if interval < 0 {
+			return
+		}
+		now := time.Now()
+		if now.Sub(lastBeat) < interval {
+			return
+		}
+		lastBeat = now
+		shown := currentDir
+		if shown == "" {
+			shown = "(root)"
+		}
+		log.Printf("[scanner] drive=%s progress: scanned=%d added=%d errors=%d dirs=%d elapsed=%s at=%s",
+			driveID, stats.Scanned, stats.Added, stats.Errors, len(stats.VisitedDirIDs),
+			now.Sub(started).Round(time.Second), shown)
+	}
+
+	if err := s.walk(ctx, startDirID, "", 0, &stats, progress); err != nil {
 		return stats, err
 	}
 	return stats, nil
 }
 
-func (s *Scanner) walk(ctx context.Context, dirID, dirName string, depth int, stats *Stats) error {
+func (s *Scanner) walk(ctx context.Context, dirID, dirName string, depth int, stats *Stats, progress func(string)) error {
 	if depth >= s.MaxDepth {
 		return nil
 	}
@@ -71,6 +109,7 @@ func (s *Scanner) walk(ctx context.Context, dirID, dirName string, depth int, st
 		return err
 	}
 	stats.VisitedDirIDs[dirID] = struct{}{}
+	progress(dirName) // 心跳：进入新目录前后是天然的节流点
 
 	entries, err := s.Drive.List(ctx, dirID)
 	if err != nil {
@@ -90,7 +129,7 @@ func (s *Scanner) walk(ctx context.Context, dirID, dirName string, depth int, st
 				}
 				continue
 			}
-			if err := s.walk(ctx, e.ID, e.Name, depth+1, stats); err != nil {
+			if err := s.walk(ctx, e.ID, e.Name, depth+1, stats, progress); err != nil {
 				stats.Errors++
 				log.Printf("[scanner] walk %s error: %v", e.Name, err)
 			}
@@ -185,6 +224,10 @@ func (s *Scanner) walk(ctx context.Context, dirID, dirName string, depth int, st
 		if s.OnNewVideo != nil {
 			s.OnNewVideo(v)
 		}
+		// 兜底：如果某个目录里挤了几千个文件，仅靠"进目录心跳"会很久不响一下；
+		// 在每条文件处理完之后再 ping 一次，progress 内部的 30s 节流会把绝大多数
+		// 调用变成廉价的时间比较。
+		progress(dirName)
 	}
 	return nil
 }

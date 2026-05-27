@@ -36,6 +36,10 @@ type AdminServer struct {
 	// Spider91 → PikPak 上传目标 drive ID 读写
 	GetSpider91UploadDriveID func() string
 	SetSpider91UploadDriveID func(driveID string) error
+	// OnRunNightlyJob 触发一次完整的凌晨流水线（Phase1 扫盘 + Phase2 91 爬虫 +
+	// Phase3 迁移）。立即返回 —— 实际任务在后台跑，admin 在日志或下次状态查询里
+	// 看进度。重复点击会被 Runner.TryLock 丢弃。
+	OnRunNightlyJob func()
 }
 
 type GenerationStatus struct {
@@ -83,6 +87,9 @@ func (a *AdminServer) Register(r chi.Router) {
 			// 运行时设置
 			r.Get("/settings", a.handleGetSettings)
 			r.Put("/settings", a.handlePutSettings)
+
+			// 运维任务
+			r.Post("/jobs/nightly/run", a.handleRunNightlyJob)
 		})
 	})
 }
@@ -305,6 +312,16 @@ func (a *AdminServer) handleRescan(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	if a.OnScanRequested != nil {
 		a.OnScanRequested(id)
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true})
+}
+
+// handleRunNightlyJob 触发一次完整的凌晨流水线（不论当前时间，不论今日是否已跑）。
+// 立即返回 202；进度通过 backend 日志和下次 GET /admin/api/drives 的状态变化观察。
+// 流水线已在跑时 Runner 会丢弃此次触发并记日志。
+func (a *AdminServer) handleRunNightlyJob(w http.ResponseWriter, r *http.Request) {
+	if a.OnRunNightlyJob != nil {
+		a.OnRunNightlyJob()
 	}
 	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true})
 }

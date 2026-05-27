@@ -129,8 +129,11 @@ type Config struct {
 	Catalog          *catalog.Catalog
 	Registry         Registry
 	GetTargetDriveID func() string // 通常对应 App.Spider91UploadDriveID()
-	Interval         time.Duration // 0 时默认 60s
-	BatchLimit       int           // 单轮最多迁多少个，0 时默认 50
+	// Interval 已废弃 —— 旧版迁移 worker 是周期 ticker，新版只通过 nightly
+	// pipeline 调用 RunOnce，不再有内置定时器。保留字段不删是为了兼容外
+	// 部 yaml / 测试代码里仍传值的场景。
+	Interval   time.Duration
+	BatchLimit int // 单轮最多迁多少个，0 时默认 50
 	// KeepLatestN 是每个 spider91 drive 在本地保留的最新视频数。
 	// 超过的部分中"已迁移"的会被清理；未迁移的不动。0 时默认 15；< 0 关闭清理。
 	KeepLatestN int
@@ -143,7 +146,6 @@ type Config struct {
 
 type Migrator struct {
 	cfg     Config
-	trigger chan struct{}
 	mu      sync.Mutex
 	running bool
 
@@ -158,9 +160,6 @@ type Migrator struct {
 }
 
 func New(cfg Config) *Migrator {
-	if cfg.Interval == 0 {
-		cfg.Interval = 60 * time.Second
-	}
 	if cfg.BatchLimit == 0 {
 		cfg.BatchLimit = 50
 	}
@@ -171,8 +170,7 @@ func New(cfg Config) *Migrator {
 		cfg.CaptchaCooldown = 5 * time.Minute
 	}
 	return &Migrator{
-		cfg:     cfg,
-		trigger: make(chan struct{}, 1),
+		cfg: cfg,
 	}
 }
 
@@ -228,67 +226,19 @@ func (m *Migrator) markCooldownLogged() bool {
 }
 
 // Trigger 安排一次"立即跑"。多次调用会被合并成一次（channel buffer=1）。
-func (m *Migrator) Trigger() {
-	select {
-	case m.trigger <- struct{}{}:
-	default:
-	}
-}
-
-// Run 是阻塞循环；ctx 取消时退出。
-func (m *Migrator) Run(ctx context.Context) {
-	t := time.NewTicker(m.cfg.Interval)
-	defer t.Stop()
-	var cooldownTimer *time.Timer
-	var cooldownC <-chan time.Time
-	stopCooldownTimer := func() {
-		if cooldownTimer == nil {
-			return
-		}
-		if !cooldownTimer.Stop() {
-			select {
-			case <-cooldownTimer.C:
-			default:
-			}
-		}
-		cooldownTimer = nil
-		cooldownC = nil
-	}
-	resetCooldownTimer := func() {
-		stopCooldownTimer()
-		active, until := m.inCooldown()
-		if !active {
-			return
-		}
-		delay := time.Until(until)
-		if delay < 0 {
-			delay = 0
-		}
-		cooldownTimer = time.NewTimer(delay)
-		cooldownC = cooldownTimer.C
-	}
-	defer stopCooldownTimer()
-
-	// 启动后立刻跑一次（不等第一个 tick）
+// RunOnce 跑一次完整迁移：列出所有 spider91 drive，对每个超过 KeepLatestN 的旧
+// 视频上传到目标 drive，事务性改写 catalog 行，删本地文件。
+//
+// 这是上层 nightly 流水线 Phase 3 的入口；不再有周期 ticker / Trigger 通道。
+// captcha cooldown 状态在单次 RunOnce 内仍生效（多 drive 时遇到 4002 立即停整轮）；
+// 跨调用持久 5 分钟，下次 RunOnce 命中冷却期会直接 noop。
+//
+// 当前实现不会向调用方返回 error —— 单条迁移失败已在内部记日志并跳过；
+// 整轮被 cooldown / context 取消时也通过日志可观测。保留 error 返回签名是为
+// 给未来需要把 nightly 失败状态展示给 admin 用。
+func (m *Migrator) RunOnce(ctx context.Context) error {
 	m.runOnce(ctx)
-	resetCooldownTimer()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			m.runOnce(ctx)
-			resetCooldownTimer()
-		case <-m.trigger:
-			m.runOnce(ctx)
-			resetCooldownTimer()
-		case <-cooldownC:
-			cooldownTimer = nil
-			cooldownC = nil
-			m.runOnce(ctx)
-			resetCooldownTimer()
-		}
-	}
+	return nil
 }
 
 // runOnce 单轮：扫所有 spider91 drive，对每条还有本地文件的视频做迁移。

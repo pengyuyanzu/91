@@ -3,7 +3,10 @@ package scanner
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"io"
+	"log"
+	"strings"
 	"testing"
 	"time"
 
@@ -601,3 +604,79 @@ func (d *scannerTreeFakeDrive) EnsureDir(context.Context, string) (string, error
 	return "", drives.ErrNotSupported
 }
 func (d *scannerTreeFakeDrive) RootID() string { return "root" }
+
+
+// captureLog 把 log 包默认输出引到一个 bytes.Buffer，便于断言进度日志被打印；
+// 测试结束自动恢复。
+func captureLog(t *testing.T) *strings.Builder {
+	t.Helper()
+	buf := &strings.Builder{}
+	originalOutput := log.Writer()
+	originalFlags := log.Flags()
+	log.SetOutput(buf)
+	log.SetFlags(0)
+	t.Cleanup(func() {
+		log.SetOutput(originalOutput)
+		log.SetFlags(originalFlags)
+	})
+	return buf
+}
+
+func TestScannerProgressHeartbeatEmits(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { cat.Close() })
+
+	// 准备 5 个文件，足够触发循环结尾的 progress() 调用至少一次。
+	entries := make([]drives.Entry, 5)
+	for i := range entries {
+		entries[i] = drives.Entry{
+			ID:      fmt.Sprintf("file-%d", i),
+			Name:    fmt.Sprintf("clip-%d.mp4", i),
+			Size:    100,
+			ModTime: time.Now(),
+		}
+	}
+	drv := &scannerFakeDrive{entries: entries}
+
+	sc := New(cat, drv, []string{".mp4"}, 5, nil)
+	// 极短间隔，确保至少一次 heartbeat 在 walk 内被触发
+	sc.ProgressInterval = 1 * time.Microsecond
+
+	buf := captureLog(t)
+	if _, err := sc.Run(ctx, ""); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+
+	out := buf.String()
+	if !strings.Contains(out, "[scanner] drive=drive progress:") {
+		t.Fatalf("expected progress heartbeat in log, got:\n%s", out)
+	}
+}
+
+func TestScannerProgressHeartbeatDisabled(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() { cat.Close() })
+
+	drv := &scannerFakeDrive{entries: []drives.Entry{
+		{ID: "f-1", Name: "x.mp4", Size: 1, ModTime: time.Now()},
+	}}
+	sc := New(cat, drv, []string{".mp4"}, 5, nil)
+	sc.ProgressInterval = -1 // 显式关闭
+
+	buf := captureLog(t)
+	if _, err := sc.Run(ctx, ""); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+
+	if strings.Contains(buf.String(), "progress:") {
+		t.Fatalf("progress heartbeat should be silenced when interval < 0, got:\n%s", buf.String())
+	}
+}

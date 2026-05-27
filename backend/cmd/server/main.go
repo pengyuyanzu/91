@@ -29,6 +29,7 @@ import (
 	"github.com/video-site/backend/internal/drives/quark"
 	"github.com/video-site/backend/internal/drives/spider91"
 	"github.com/video-site/backend/internal/drives/wopan"
+	"github.com/video-site/backend/internal/nightly"
 	"github.com/video-site/backend/internal/preview"
 	"github.com/video-site/backend/internal/proxy"
 	"github.com/video-site/backend/internal/scanner"
@@ -167,6 +168,11 @@ func main() {
 		SetSpider91UploadDriveID: func(id string) error {
 			return app.SetSpider91UploadDriveID(ctx, id)
 		},
+		OnRunNightlyJob: func() {
+			if app.nightlyRunner != nil {
+				app.nightlyRunner.TriggerNow()
+			}
+		},
 	}
 
 	r := chi.NewRouter()
@@ -177,12 +183,23 @@ func main() {
 	apiServer.RegisterRoutes(r, authr)
 	adminServer.Register(r)
 
-	// 启动定时扫描
-	go app.scanLoop(ctx)
-	// spider91 爬虫专用的凌晨任务（默认 00:30 触发，避开网盘扫描窗口）
-	go app.crawlerLoop(ctx)
-	// spider91 → PikPak 上传 worker
-	go app.spider91Migrator.Run(ctx)
+	// 凌晨流水线：每天 cron_hour 触发一次，串行跑
+	//   Phase 1 扫所有非 spider91 / localupload 网盘 + 删除检测 + 入队封面/teaser
+	//   Phase 2 spider91 爬虫 + 入队 teaser
+	//   Phase 3 spider91 → 云盘迁移
+	// 也响应 admin "立即跑全流程" 按钮（POST /admin/api/jobs/nightly/run → TriggerNow）。
+	app.nightlyRunner = nightly.New(nightly.Config{
+		Settings:              cat,
+		CronHour:              cfg.Nightly.CronHour,
+		MaxDuration:           cfg.Nightly.MaxDuration,
+		ListScanTargets:       app.listScanTargetIDs,
+		RunScan:               app.runScan,
+		ListSpider91Drives:    app.listSpider91DriveIDs,
+		RunSpider91Crawl:      app.runSpider91Crawl,
+		WaitPreviewQueuesIdle: app.waitAllPreviewQueuesIdle,
+		RunMigration:          app.spider91Migrator.RunOnce,
+	})
+	go app.nightlyRunner.Run(ctx)
 
 	srv := &http.Server{
 		Addr:    cfg.Server.Listen,
@@ -228,6 +245,10 @@ type App struct {
 
 	// spider91Migrator 周期把 spider91 视频上传到目标 drive（PikPak 或 115）。
 	spider91Migrator *spider91migrate.Migrator
+
+	// nightlyRunner 是凌晨流水线调度器：每天 cron_hour 串行跑扫盘 → 91 爬虫 → 迁移。
+	// 也响应 admin 「立即跑全流程」按钮（TriggerNow）。
+	nightlyRunner *nightly.Runner
 }
 
 // teaserEnabledForDrive 查询某个 drive 当前的 per-drive teaser 开关。
@@ -832,15 +853,22 @@ func (a *App) runScan(ctx context.Context, driveID string) {
 			log.Printf("[cleanup] removed %d excluded 115 videos for drive=%s", removed, driveID)
 		}
 	}
-	if drv.Kind() == "pikpak" {
+	// 删除检测：扫描到的 file_ids 是当前云盘上的真实存在；catalog 里这个 drive
+	// 名下、且其 parent_id 处在本次扫描走过的目录内（或本次是从根扫的）、却
+	// 不在 SeenFileIDs 中的视频 → 视为已被删除。
+	//
+	// spider91 / localupload 走自己的生命周期管理，不应该参与扫描清理；
+	// stats.Errors > 0 时（云盘 API 中途抖动）保守起见跳过这一轮，避免把
+	// "暂时列不出来"误认成"被用户删了"。
+	if drv.Kind() != spider91.Kind && drv.ID() != localupload.DriveID {
 		if stats.Errors > 0 {
-			log.Printf("[cleanup] skip stale PikPak cleanup for drive=%s: scan had %d directory errors", driveID, stats.Errors)
+			log.Printf("[cleanup] skip stale cleanup for drive=%s kind=%s: scan had %d directory errors", driveID, drv.Kind(), stats.Errors)
 		} else {
 			removed, err := a.cleanupMissingDriveVideos(ctx, driveID, stats.SeenFileIDs, stats.VisitedDirIDs, startID == drv.RootID())
 			if err != nil {
-				log.Printf("[cleanup] stale PikPak cleanup drive=%s error: %v", driveID, err)
+				log.Printf("[cleanup] stale cleanup drive=%s kind=%s error: %v", driveID, drv.Kind(), err)
 			} else if removed > 0 {
-				log.Printf("[cleanup] removed %d stale PikPak videos for drive=%s", removed, driveID)
+				log.Printf("[cleanup] removed %d stale videos for drive=%s kind=%s", removed, driveID, drv.Kind())
 			}
 		}
 	}
@@ -1056,61 +1084,60 @@ func (a *App) regenFailedPreviews(ctx context.Context, driveID string) {
 	log.Printf("[preview] enqueued failed videos for regen drive=%s queued=%d", driveID, queued)
 }
 
-func (a *App) scanLoop(ctx context.Context) {
-	if a.cfg.Scanner.IntervalSeconds <= 0 {
-		return
-	}
-	interval := time.Duration(a.cfg.Scanner.IntervalSeconds) * time.Second
-	var lastScheduledScan time.Time
-	if a.scanAllOnceIfDue(ctx, time.Now(), lastScheduledScan, interval) {
-		lastScheduledScan = time.Now()
-	}
-
-	checkEvery := interval
-	if checkEvery > time.Minute {
-		checkEvery = time.Minute
-	}
-	ticker := time.NewTicker(checkEvery)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case now := <-ticker.C:
-			if a.scanAllOnceIfDue(ctx, now, lastScheduledScan, interval) {
-				lastScheduledScan = now
-			}
-		}
-	}
-}
-
-func (a *App) scanAllOnceIfDue(ctx context.Context, now, lastScheduledScan time.Time, interval time.Duration) bool {
-	if !scheduledScanDue(now, lastScheduledScan, interval) {
-		return false
-	}
-	a.scanAllOnce(ctx)
-	return true
-}
-
-func scheduledScanDue(now, lastScheduledScan time.Time, interval time.Duration) bool {
-	if interval <= 0 || !scheduledScanAllowed(now) {
-		return false
-	}
-	return lastScheduledScan.IsZero() || now.Sub(lastScheduledScan) >= interval
-}
-
-func scheduledScanAllowed(now time.Time) bool {
-	hour := now.Hour()
-	return hour >= 2 && hour < 7
-}
-
-func (a *App) scanAllOnce(ctx context.Context) {
-	for _, d := range a.registry.All() {
+// listScanTargetIDs 返回 nightly Phase 1 应扫描的所有 drive ID
+// （非 spider91、非 localupload）。顺序按 registry.All 给的稳定顺序。
+func (a *App) listScanTargetIDs(_ context.Context) []string {
+	all := a.registry.All()
+	out := make([]string, 0, len(all))
+	for _, d := range all {
 		if !shouldScanDrive(d) {
 			continue
 		}
-		a.runScan(ctx, d.ID())
+		out = append(out, d.ID())
 	}
+	return out
+}
+
+// listSpider91DriveIDs 返回 nightly Phase 2 应触发爬取的 spider91 drive ID 列表。
+func (a *App) listSpider91DriveIDs(_ context.Context) []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	out := make([]string, 0, len(a.spider91Crawlers))
+	for id := range a.spider91Crawlers {
+		out = append(out, id)
+	}
+	return out
+}
+
+// waitAllPreviewQueuesIdle 阻塞直到所有 drive 的封面 worker 和 teaser worker
+// 队列都为空且无 in-flight 任务。
+//
+// 顺序：先等所有 thumb worker（因为 enqueueDriveGeneration 内部已经先等当前
+// drive 的封面再入队 teaser，但这里是跨 drive 的全局同步），再等所有 teaser。
+// 若 ctx 在等待中被取消（软超时 / shutdown），立即返回 ctx.Err。
+func (a *App) waitAllPreviewQueuesIdle(ctx context.Context) error {
+	a.mu.Lock()
+	thumbWorkers := make([]*preview.ThumbWorker, 0, len(a.thumbWorkers))
+	previewWorkers := make([]*preview.Worker, 0, len(a.workers))
+	for _, w := range a.thumbWorkers {
+		thumbWorkers = append(thumbWorkers, w)
+	}
+	for _, w := range a.workers {
+		previewWorkers = append(previewWorkers, w)
+	}
+	a.mu.Unlock()
+
+	for _, w := range thumbWorkers {
+		if err := w.WaitIdle(ctx); err != nil {
+			return err
+		}
+	}
+	for _, w := range previewWorkers {
+		if err := w.WaitIdle(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func shouldScanDrive(d drives.Drive) bool {
@@ -1124,78 +1151,13 @@ func shouldScanDrive(d drives.Drive) bool {
 	return true
 }
 
-// ---------- spider91 crawler loop ----------
-
-const (
-	// spider91DefaultCrawlHour 默认在凌晨 00 点的窗口内触发；可被每个 drive 的
-	// credentials.crawl_hour 覆盖。
-	spider91DefaultCrawlHour = 0
-	// spider91MinIntervalHours 两次自动爬取之间的最小间隔，避免一天触发多次。
-	spider91MinIntervalHours = 12
-)
-
-// crawlerLoop 每分钟轮询一次，命中触发窗口的 spider91 drive 就启动一次爬取。
-// 每个 drive 单独跟踪 last_crawl_at（写在 credentials 里）。
-func (a *App) crawlerLoop(ctx context.Context) {
-	ticker := time.NewTicker(time.Minute)
-	defer ticker.Stop()
-	// 启动后立刻检查一次（可能错过了今天的窗口）
-	a.tickSpider91(ctx, time.Now())
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case now := <-ticker.C:
-			a.tickSpider91(ctx, now)
-		}
-	}
-}
-
-// tickSpider91 检查所有 spider91 drive，决定哪些该触发。
-func (a *App) tickSpider91(ctx context.Context, now time.Time) {
-	a.mu.Lock()
-	crawlerIDs := make([]string, 0, len(a.spider91Crawlers))
-	for id := range a.spider91Crawlers {
-		crawlerIDs = append(crawlerIDs, id)
-	}
-	a.mu.Unlock()
-
-	for _, id := range crawlerIDs {
-		d, err := a.cat.GetDrive(ctx, id)
-		if err != nil || d == nil {
-			continue
-		}
-		if !spider91DueAt(now, d) {
-			continue
-		}
-		go a.runSpider91Crawl(ctx, id)
-	}
-}
-
-// spider91DueAt 判断 drive 是否应该在 now 触发自动爬取。
-//   - 当前小时必须等于 drive.crawl_hour（默认 0）
-//   - 距离上次 last_crawl_at 至少 spider91MinIntervalHours 小时
-func spider91DueAt(now time.Time, d *catalog.Drive) bool {
-	if d == nil {
-		return false
-	}
-	hour := spider91IntCred(d, "crawl_hour", spider91DefaultCrawlHour)
-	if hour < 0 || hour > 23 {
-		hour = spider91DefaultCrawlHour
-	}
-	if now.Hour() != hour {
-		return false
-	}
-	last := spider91IntCred(d, "last_crawl_at", 0)
-	if last <= 0 {
-		return true
-	}
-	delta := now.Sub(time.Unix(int64(last), 0))
-	return delta >= time.Duration(spider91MinIntervalHours)*time.Hour
-}
+// ---------- spider91 crawl ----------
 
 // runSpider91Crawl 运行一次完整爬取流程并把 last_crawl_at 写回 drive.credentials。
-// 即使爬取失败也会更新 last_crawl_at，避免一直在错误循环里反复触发；下次窗口仍会重试。
+//
+// 即使爬取失败也会更新 last_crawl_at，避免一直在错误循环里反复触发；下一次 nightly
+// 流水线重跑时仍会重试。该方法是阻塞的，被 nightly Phase 2 串行调用，以及被
+// admin "立即抓取" 单 drive 异步调用。
 func (a *App) runSpider91Crawl(ctx context.Context, driveID string) {
 	a.mu.Lock()
 	c := a.spider91Crawlers[driveID]
@@ -1223,7 +1185,8 @@ func (a *App) runSpider91Crawl(ctx context.Context, driveID string) {
 			driveID, res.TargetNew, res.TotalEntries, res.NewVideos, res.Skipped, res.Failed, res.SeenSnapshot)
 	}
 
-	// 标记最后一次爬取时间
+	// 标记最后一次爬取时间。这字段已不再用于调度判定（nightly 流水线统一调度），
+	// 留着仅作为 admin UI 显示"上次抓取 N 小时前"用。
 	if d.Credentials == nil {
 		d.Credentials = make(map[string]string)
 	}
@@ -1237,11 +1200,6 @@ func (a *App) runSpider91Crawl(ctx context.Context, driveID string) {
 	}
 	if err := a.cat.UpsertDrive(ctx, d); err != nil {
 		log.Printf("[spider91] drive=%s update last_crawl_at: %v", driveID, err)
-	}
-
-	// 爬完立刻 ping 一次迁移 worker，不等下一个周期。
-	if a.spider91Migrator != nil {
-		a.spider91Migrator.Trigger()
 	}
 }
 

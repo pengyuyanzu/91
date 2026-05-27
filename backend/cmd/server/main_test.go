@@ -375,46 +375,6 @@ func TestEnqueueUploadedVideoQueuesLocalPreviewWorker(t *testing.T) {
 	t.Fatalf("preview status = %q, want ready", got.PreviewStatus)
 }
 
-func TestScheduledScanWindowAllowsOnlyEarlyMorning(t *testing.T) {
-	loc := time.FixedZone("CST", 8*60*60)
-	cases := []struct {
-		name string
-		now  time.Time
-		want bool
-	}{
-		{name: "before window", now: time.Date(2026, 5, 12, 1, 59, 0, 0, loc), want: false},
-		{name: "at start", now: time.Date(2026, 5, 12, 2, 0, 0, 0, loc), want: true},
-		{name: "inside window", now: time.Date(2026, 5, 12, 6, 59, 0, 0, loc), want: true},
-		{name: "at end", now: time.Date(2026, 5, 12, 7, 0, 0, 0, loc), want: false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := scheduledScanAllowed(tc.now); got != tc.want {
-				t.Fatalf("scheduledScanAllowed(%s) = %v, want %v", tc.now.Format(time.RFC3339), got, tc.want)
-			}
-		})
-	}
-}
-
-func TestScheduledScanDueRespectsWindowAndInterval(t *testing.T) {
-	loc := time.FixedZone("CST", 8*60*60)
-	interval := 2 * time.Hour
-	inside := time.Date(2026, 5, 12, 2, 0, 0, 0, loc)
-
-	if scheduledScanDue(time.Date(2026, 5, 12, 1, 59, 0, 0, loc), time.Time{}, interval) {
-		t.Fatal("scheduled scan due outside window, want false")
-	}
-	if !scheduledScanDue(inside, time.Time{}, interval) {
-		t.Fatal("first scheduled scan inside window = false, want true")
-	}
-	if scheduledScanDue(inside.Add(time.Hour), inside, interval) {
-		t.Fatal("scheduled scan due before interval elapsed, want false")
-	}
-	if !scheduledScanDue(inside.Add(2*time.Hour), inside, interval) {
-		t.Fatal("scheduled scan due after interval elapsed, want true")
-	}
-}
-
 func TestShouldScanDriveSkipsLocalUpload(t *testing.T) {
 	if shouldScanDrive(&serverLocalUploadFakeDrive{}) {
 		t.Fatal("local upload drive should not be scanned")

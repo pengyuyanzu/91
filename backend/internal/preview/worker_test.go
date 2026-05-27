@@ -567,3 +567,81 @@ func (d *previewFakeDrive) EnsureDir(context.Context, string) (string, error) {
 	return "", drives.ErrNotSupported
 }
 func (d *previewFakeDrive) RootID() string { return "root" }
+
+
+func TestWorkerWaitIdleReturnsImmediatelyWhenQueueEmpty(t *testing.T) {
+	worker := NewWorker(&fakeTeaserGenerator{}, nil, &previewFakeDrive{})
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	start := time.Now()
+	if err := worker.WaitIdle(ctx); err != nil {
+		t.Fatalf("WaitIdle on empty queue: %v", err)
+	}
+	if took := time.Since(start); took > 50*time.Millisecond {
+		t.Fatalf("WaitIdle on empty queue took %s, want immediate return", took)
+	}
+}
+
+func TestWorkerWaitIdleBlocksUntilQueueDrains(t *testing.T) {
+	worker := NewWorker(&fakeTeaserGenerator{}, nil, &previewFakeDrive{})
+	v := &catalog.Video{ID: "wait-idle-vid"}
+	if !worker.queue.reserve(v) {
+		t.Fatalf("reserve should succeed on fresh queue")
+	}
+
+	go func() {
+		time.Sleep(120 * time.Millisecond)
+		worker.queue.release(v)
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	if err := worker.WaitIdle(ctx); err != nil {
+		t.Fatalf("WaitIdle: %v", err)
+	}
+	took := time.Since(start)
+	if took < 100*time.Millisecond {
+		t.Fatalf("WaitIdle returned in %s, expected to wait until release", took)
+	}
+	if took > time.Second {
+		t.Fatalf("WaitIdle took %s, expected to return shortly after release", took)
+	}
+}
+
+func TestWorkerWaitIdleHonoursContextCancel(t *testing.T) {
+	worker := NewWorker(&fakeTeaserGenerator{}, nil, &previewFakeDrive{})
+	v := &catalog.Video{ID: "ctx-cancel"}
+	if !worker.queue.reserve(v) {
+		t.Fatalf("reserve should succeed")
+	}
+	t.Cleanup(func() { worker.queue.release(v) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	if err := worker.WaitIdle(ctx); err == nil {
+		t.Fatalf("WaitIdle expected ctx.Err, got nil")
+	}
+}
+
+func TestThumbWorkerWaitIdleBlocksUntilQueueDrains(t *testing.T) {
+	worker := NewThumbWorker(&fakeThumbGenerator{}, nil, &previewFakeDrive{})
+	v := &catalog.Video{ID: "thumb-wait-idle"}
+	if !worker.queue.reserve(v) {
+		t.Fatalf("reserve should succeed")
+	}
+
+	go func() {
+		time.Sleep(80 * time.Millisecond)
+		worker.queue.release(v)
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := worker.WaitIdle(ctx); err != nil {
+		t.Fatalf("ThumbWorker.WaitIdle: %v", err)
+	}
+}

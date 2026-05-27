@@ -324,8 +324,7 @@ func TestRunOnceMigratesSpider91VideosAndCleansLocalFiles(t *testing.T) {
 		Catalog:          cat,
 		Registry:         reg,
 		GetTargetDriveID: func() string { return pp.ID() },
-		Interval:         time.Hour, // 测试不靠 ticker
-		KeepLatestN:      -1,        // 关闭"保留最新 N 个"，让 1 条也能立即上传
+		KeepLatestN:      -1, // 关闭"保留最新 N 个"，让 1 条也能立即上传
 	})
 	m.runOnce(context.Background())
 
@@ -805,75 +804,6 @@ func TestRunOnceResumesAfterCooldownExpires(t *testing.T) {
 	}
 }
 
-// TestRunWakesWhenCooldownExpires 验证 Run 循环会在 cooldown 到点后主动唤醒
-// 一次迁移，而不是等下一个普通 interval tick。
-func TestRunWakesWhenCooldownExpires(t *testing.T) {
-	cat := setupCatalog(t)
-	src, _ := setupSpider91(t)
-	pp := newFakePikPak("pikpak-target", "pikpak-root-id")
-
-	migrated := make(chan struct{}, 1)
-	var failOnce sync.Once
-	pp.uploadFunc = func(ctx context.Context, parentID, name string, r io.Reader, size int64) (UploadResult, error) {
-		body, _ := io.ReadAll(r)
-		var failed bool
-		failOnce.Do(func() { failed = true })
-		if failed {
-			captcha := &pikpak.APIError{ErrorCode: 4002, ErrorMsg: "captcha_invalid"}
-			return UploadResult{}, fmt.Errorf("pikpak upload: request session: %w", captcha)
-		}
-		pp.mu.Lock()
-		pp.gotBodies[name] = body
-		pp.mu.Unlock()
-		return UploadResult{
-			FileID: "remote-" + name,
-			Hash:   "FAKEHASH40CHARSXXXXXXXXXXXXXXXXXXXXXXXXX",
-			Size:   int64(len(body)),
-		}, nil
-	}
-	reg := newFakeRegistry()
-	reg.Add(src)
-	reg.Add(pp)
-
-	now := time.Now()
-	id := writeSpider91Video(t, cat, src, "vk-auto-resume", ".mp4", []byte("payload"), now)
-
-	m := New(Config{
-		Catalog:          cat,
-		Registry:         reg,
-		GetTargetDriveID: func() string { return pp.ID() },
-		Interval:         time.Hour,
-		KeepLatestN:      -1,
-		CaptchaCooldown:  30 * time.Millisecond,
-		OnMigrated: func(videoID string) {
-			if videoID == id {
-				select {
-				case migrated <- struct{}{}:
-				default:
-				}
-			}
-		},
-	})
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go m.Run(ctx)
-
-	select {
-	case <-migrated:
-	case <-time.After(500 * time.Millisecond):
-		t.Fatalf("Run did not resume migration after cooldown expired")
-	}
-
-	got, err := cat.GetVideo(context.Background(), id)
-	if err != nil {
-		t.Fatalf("get video: %v", err)
-	}
-	if got.DriveID != pp.ID() {
-		t.Fatalf("after auto resume, drive_id = %q, want PikPak", got.DriveID)
-	}
-}
-
 // TestNonCaptchaErrorDoesNotTriggerCooldown 验证非 captcha 类的上传错误（如
 // 网络抖动）不会让整个 worker 进冷却 —— 只跳过这一条，继续尝试 batch 里其它的。
 func TestNonCaptchaErrorDoesNotTriggerCooldown(t *testing.T) {
@@ -936,7 +866,6 @@ func TestRunOnceMigratesToP115Target(t *testing.T) {
 		Catalog:          cat,
 		Registry:         reg,
 		GetTargetDriveID: func() string { return target.ID() },
-		Interval:         time.Hour,
 		KeepLatestN:      -1,
 	})
 	m.runOnce(context.Background())
