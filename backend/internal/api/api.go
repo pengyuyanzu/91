@@ -40,7 +40,7 @@ var allowedUploadExtensions = map[string]struct{}{
 var allowedUploadTags = map[string]struct{}{
 	"奶子": {},
 	"臀":  {},
-	"口角": {},
+	"口交": {},
 	"女大": {},
 	"人妻": {},
 	"AV": {},

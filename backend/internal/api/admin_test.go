@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -660,6 +661,64 @@ func TestHandleCreateTagClassifiesExistingVideos(t *testing.T) {
 	}
 	if len(video.Tags) != 1 || video.Tags[0] != "清纯" {
 		t.Fatalf("video tags = %#v, want 清纯", video.Tags)
+	}
+}
+
+func TestHandleDeleteTagRemovesTagFromVideos(t *testing.T) {
+	ctx := context.Background()
+	cat, err := catalog.Open(t.TempDir() + "/catalog.db")
+	if err != nil {
+		t.Fatalf("open catalog: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := cat.Close(); err != nil {
+			t.Fatalf("close catalog: %v", err)
+		}
+	})
+
+	now := time.Now()
+	if err := cat.UpsertVideo(ctx, &catalog.Video{
+		ID:          "video-1",
+		DriveID:     "drive",
+		FileID:      "file-1",
+		Title:       "清纯短发",
+		PublishedAt: now,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}); err != nil {
+		t.Fatalf("seed video: %v", err)
+	}
+	if _, err := cat.CreateTagAndClassify(ctx, "清纯", nil, "user"); err != nil {
+		t.Fatalf("create tag: %v", err)
+	}
+	tags, err := cat.ListTags(ctx)
+	if err != nil {
+		t.Fatalf("list tags: %v", err)
+	}
+	var tagID int64
+	for _, tag := range tags {
+		if tag.Label == "清纯" {
+			tagID = tag.ID
+			break
+		}
+	}
+	if tagID == 0 {
+		t.Fatal("created tag not found")
+	}
+
+	req := requestWithRouteParam(http.MethodDelete, "/admin/api/tags/1", "id", strconv.FormatInt(tagID, 10), strings.NewReader(``))
+	rr := httptest.NewRecorder()
+	(&AdminServer{Catalog: cat}).handleDeleteTag(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	video, err := cat.GetVideo(ctx, "video-1")
+	if err != nil {
+		t.Fatalf("get video: %v", err)
+	}
+	if len(video.Tags) != 0 {
+		t.Fatalf("video tags = %#v, want none", video.Tags)
 	}
 }
 

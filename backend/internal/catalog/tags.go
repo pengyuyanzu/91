@@ -17,6 +17,7 @@ import (
 )
 
 var ErrUnknownTag = errors.New("unknown tag")
+var ErrSystemTag = errors.New("system tag cannot be deleted")
 
 const avTagLabel = "AV"
 
@@ -378,6 +379,62 @@ func (c *Catalog) CreateTagAndClassify(ctx context.Context, label string, aliase
 		return 0, err
 	}
 	return c.classifyTag(ctx, tag)
+}
+
+func (c *Catalog) DeleteTag(ctx context.Context, tagID int64) (int, error) {
+	tx, err := c.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+
+	tag, err := c.getTagByIDTx(ctx, tx, tagID)
+	if err != nil {
+		return 0, err
+	}
+	if tag.Source == "system" {
+		return 0, ErrSystemTag
+	}
+
+	rows, err := tx.QueryContext(ctx, `SELECT video_id FROM video_tags WHERE tag_id = ?`, tagID)
+	if err != nil {
+		return 0, err
+	}
+	var videoIDs []string
+	for rows.Next() {
+		var videoID string
+		if err := rows.Scan(&videoID); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		videoIDs = append(videoIDs, videoID)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, err
+	}
+	if err := rows.Close(); err != nil {
+		return 0, err
+	}
+
+	if _, err := tx.ExecContext(ctx, `DELETE FROM video_tags WHERE tag_id = ?`, tagID); err != nil {
+		return 0, err
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM tags WHERE id = ?`, tagID); err != nil {
+		return 0, err
+	}
+
+	for _, videoID := range videoIDs {
+		manual := hasManualTagsTx(ctx, tx, videoID)
+		if err := syncVideoTagsJSONTx(ctx, tx, videoID, manual); err != nil {
+			return 0, err
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return len(videoIDs), nil
 }
 
 func (c *Catalog) ListTags(ctx context.Context) ([]Tag, error) {
@@ -815,6 +872,56 @@ func (c *Catalog) getTagByLabelTx(ctx context.Context, tx *sql.Tx, label string)
 		`SELECT id, label, aliases, source, 0 FROM tags WHERE label = ? COLLATE NOCASE`,
 		label)
 	return scanTag(row)
+}
+
+func (c *Catalog) getTagByIDTx(ctx context.Context, tx *sql.Tx, id int64) (Tag, error) {
+	row := tx.QueryRowContext(ctx,
+		`SELECT id, label, aliases, source, 0 FROM tags WHERE id = ?`,
+		id)
+	return scanTag(row)
+}
+
+func hasManualTagsTx(ctx context.Context, tx *sql.Tx, videoID string) bool {
+	var manual int
+	err := tx.QueryRowContext(ctx, `SELECT COALESCE(tags_manual, 0) FROM videos WHERE id = ?`, videoID).Scan(&manual)
+	return err == nil && manual == 1
+}
+
+func syncVideoTagsJSONTx(ctx context.Context, tx *sql.Tx, videoID string, manual bool) error {
+	rows, err := tx.QueryContext(ctx, `
+SELECT t.label
+FROM video_tags vt
+JOIN tags t ON t.id = vt.tag_id
+WHERE vt.video_id = ?
+ORDER BY t.id ASC`, videoID)
+	if err != nil {
+		return err
+	}
+	var labels []string
+	for rows.Next() {
+		var label string
+		if err := rows.Scan(&label); err != nil {
+			rows.Close()
+			return err
+		}
+		labels = append(labels, label)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	labelsJSON, _ := json.Marshal(labels)
+	manualValue := 0
+	if manual {
+		manualValue = 1
+	}
+	_, err = tx.ExecContext(ctx,
+		`UPDATE videos SET tags = ?, tags_manual = ?, updated_at = ? WHERE id = ?`,
+		string(labelsJSON), manualValue, time.Now().UnixMilli(), videoID)
+	return err
 }
 
 type tagRowScanner interface {

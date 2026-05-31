@@ -333,6 +333,13 @@ export function createTag(label: string, aliases: string[]) {
   });
 }
 
+export function deleteTag(id: number) {
+  return request<{ ok: boolean; removedVideos: number }>(
+    `/tags/${encodeURIComponent(String(id))}`,
+    { method: "DELETE" }
+  );
+}
+
 // ---------- Settings ----------
 
 export type Theme = "dark" | "pink";

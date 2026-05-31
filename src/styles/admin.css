@@ -2242,3 +2242,34 @@
   font-weight: var(--weight-semibold);
   color: var(--text-default);
 }
+
+.admin-tag-card__footer-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.admin-tag-card__delete {
+  border: 1px solid var(--danger);
+  background: var(--danger-soft);
+  color: var(--danger);
+  border-radius: var(--radius-xs);
+  padding: 3px 6px;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 10px;
+  font-weight: var(--weight-semibold);
+  cursor: pointer;
+  transition: all var(--transition-fast);
+}
+
+.admin-tag-card__delete:hover:not(:disabled) {
+  background: var(--danger);
+  color: white;
+}
+
+.admin-tag-card__delete:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}

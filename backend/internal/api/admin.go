@@ -121,6 +121,7 @@ func (a *AdminServer) Register(r chi.Router) {
 			// 标签
 			r.Get("/tags", a.handleListTags)
 			r.Post("/tags", a.handleCreateTag)
+			r.Delete("/tags/{id}", a.handleDeleteTag)
 
 			// 运行时设置
 			r.Get("/settings", a.handleGetSettings)
@@ -743,6 +744,27 @@ func (a *AdminServer) handleCreateTag(w http.ResponseWriter, r *http.Request) {
 		"label":      body.Label,
 		"classified": classified,
 	})
+}
+
+func (a *AdminServer) handleDeleteTag(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(chi.URLParam(r, "id"), 10, 64)
+	if err != nil || id <= 0 {
+		writeErr(w, http.StatusBadRequest, errors.New("invalid tag id"))
+		return
+	}
+	removedVideos, err := a.Catalog.DeleteTag(r.Context(), id)
+	if err != nil {
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			writeErr(w, http.StatusNotFound, err)
+		case errors.Is(err, catalog.ErrSystemTag):
+			writeErr(w, http.StatusBadRequest, err)
+		default:
+			writeErr(w, http.StatusInternalServerError, err)
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "removedVideos": removedVideos})
 }
 
 type updateVideoReq struct {

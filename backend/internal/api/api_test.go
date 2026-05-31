@@ -261,7 +261,7 @@ func TestHandleUploadVideoSavesFileVideoTagsAndQueuesPreview(t *testing.T) {
 	}
 	req := multipartUploadRequest(t, map[string]string{
 		"title": "用户上传标题",
-		"tags":  "奶子,AV,女大",
+		"tags":  "奶子,口交,AV,女大",
 	}, "clip.mp4", "video-bytes")
 	rr := httptest.NewRecorder()
 
@@ -287,7 +287,7 @@ func TestHandleUploadVideoSavesFileVideoTagsAndQueuesPreview(t *testing.T) {
 	if got.Title != "用户上传标题" {
 		t.Fatalf("title = %q, want submitted title", got.Title)
 	}
-	if !sameStringSet(got.Tags, []string{"奶子", "AV", "女大"}) {
+	if !sameStringSet(got.Tags, []string{"奶子", "口交", "AV", "女大"}) {
 		t.Fatalf("tags = %#v, want selected tags", got.Tags)
 	}
 	if got.PreviewStatus != "pending" {
